@@ -18,8 +18,6 @@ from langchain.prompts import PromptTemplate
 from sentence_transformers import SentenceTransformer, util
 import os
 
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
 load_dotenv()
 
 llmtemplate = """[INST]
@@ -34,9 +32,9 @@ As an AI, provide accurate and relevant information based on the provided docume
 {question}
 [/INST]
 """
-device = f'cuda:{cuda.current_device()}' if cuda.is_available() else 'mps'
+device = f'cuda:{cuda.current_device()}' if cuda.is_available() else 'cpu'
 
-model_dir = "/Users/chandrabhanukumar/Downloads/Llama-2-7b-chat-hf"
+model_dir = "/content/drive/MyDrive/Llama-2-7b-chat-hf"
 tokenizer = AutoTokenizer.from_pretrained(model_dir)
 
 
@@ -52,52 +50,46 @@ stopping_criteria = StoppingCriteriaList([StopOnTokens()])
 stop_list = ['\nHuman:', '\n```\n']
 
 stop_token_ids = [tokenizer(x)['input_ids'] for x in stop_list]
-stop_token_ids
 
 stop_token_ids = [torch.LongTensor(x).to(device) for x in stop_token_ids]
-stop_token_ids
 
+CONDENSE_QUESTION_PROMPT = PromptTemplate.from_template(llmtemplate)
 
 def ingest_into_vectordb(split_docs):
     embeddings = HuggingFaceEmbeddings(model_name='sentence-transformers/all-MiniLM-L6-v2',
-                                       model_kwargs={'device': 'mps'})
+                                       model_kwargs={'device': 'cuda'})
     loader = CSVLoader(split_docs)
     # Load data from the csv file using the load command
     csv_data = loader.load()
-    db = FAISS.from_documents(csv_data, embeddings)
+    db = FAISS.from_documents(csv_data[:200], embeddings)
 
-    DB_FAISS_PATH = 'vectorstore/db_faiss'
-    db.save_local(DB_FAISS_PATH)
+    faiss_path = '/content/drive/MyDrive/vectorstore/db_faiss'
+    db.save_local(faiss_path)
     return db
 
 
 def get_conversation_chain(vectordb, llm, memory):
-    # llama_llm = LlamaCpp(
-    # model_path="llama-2-7b-chat.Q4_K_M.gguf",
-    # temperature=0.75,
-    # max_tokens=200,
-    # top_p=1,
-    # n_ctx=3000)
-
-    # tokenizer = AutoTokenizer.from_pretrained(model_dir)
-    # llm, memory = load_model()
-    retriever = vectordb.as_retriever()
+    
+    retriever = vectordb.as_retriever(search_kwargs={'k': 2})
 
     conversation_chain = (ConversationalRetrievalChain.from_llm
                           (llm=llm,
                            retriever=retriever,
-                           # condense_question_prompt=CONDENSE_QUESTION_PROMPT,
+                           condense_question_prompt=CONDENSE_QUESTION_PROMPT,
                            memory=memory,
-                           return_source_documents=True))
+                           return_source_documents=False))
     print("Conversational Chain created for the LLM using the vector store")
     return conversation_chain
 
 
 def load_model():
-    bnb_config = transformers.BitsAndBytesConfig(load_in_8bit=True, bnb_4bit_use_double_quant=True)
-    model = AutoModelForCausalLM.from_pretrained(model_dir, device_map="mps", torch_dtype=torch.float32,
-                                                 quantization_config=bnb_config)  # verbose=True)
-
+    bnb_config = transformers.BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type='nf4',
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.bfloat16)
+    model = transformers.AutoModelForCausalLM.from_pretrained(model_dir, quantization_config=bnb_config,
+                                                              torch_dtype=torch.bfloat16, device_map="auto", )
     model.eval()
     generate_text = transformers.pipeline(
         model=model,
@@ -120,23 +112,6 @@ def load_model():
         memory_key='chat_history', return_messages=True, output_key='answer')
     return llm, memory
 
-
-def validate_answer_against_sources(response_answer, source_documents):
-    model = SentenceTransformer('all-MiniLM-L6-v2')
-    similarity_threshold = 0.5
-    source_texts = [doc.page_content for doc in source_documents]
-
-    answer_embedding = model.encode(response_answer, convert_to_tensor=True)
-    source_embeddings = model.encode(source_texts, convert_to_tensor=True)
-
-    cosine_scores = util.pytorch_cos_sim(answer_embedding, source_embeddings)
-
-    if any(score.item() > similarity_threshold for score in cosine_scores[0]):
-        return True
-
-    return False
-
-
 def handle_userinput(user_question):
     response = st.session_state.conversation({'question': user_question})
     st.session_state.chat_history = response['chat_history']
@@ -156,7 +131,7 @@ def main():
     load_dotenv()
     llm, memory = load_model()
 
-    st.set_page_config(page_title="Chat with your PDFs",
+    st.set_page_config(page_title="Chat with your csv",
                        page_icon=":books:")
     st.write(css, unsafe_allow_html=True)
 
@@ -192,8 +167,9 @@ def main():
 
                 # create conversation chain
                 st.session_state.conversation = get_conversation_chain(
-                    vectorstore, llm, memory)
+                    vectorstore,llm, memory)
 
 
 if __name__ == '__main__':
     main()
+
